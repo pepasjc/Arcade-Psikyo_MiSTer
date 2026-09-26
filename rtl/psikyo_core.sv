@@ -96,6 +96,14 @@ module psikyo_core #(
 	input  logic         hs_read,        // hiscore wants to read (ram_intent_read)
 	input  logic         hs_write,
 
+	// ---- RetroAchievements RAM mirror tap (Psikyo.sv, jtframe_ra_mirror) ----
+	// Every write into the first 64KB of work RAM (0xFE0000-0xFEFFFF), one
+	// cycle late: 16-bit word address, data as stored, byte enables with
+	// ra_wr_be[1] = bits 15:8 = the even (big-endian high) CPU byte.
+	output logic [14:0] ra_wr_word,
+	output logic [15:0] ra_wr_din,
+	output logic [1:0]  ra_wr_be,
+
 	// Sound latch handshake -- to a sound CPU wrapper, not instantiated here.
 	output logic [7:0]  latch_data,
 	output logic         latch_write,
@@ -273,6 +281,18 @@ module psikyo_core #(
 	// widened CHECK guards there); the CPU's own read path is untouched.
 	always_ff @(posedge clk)
 		hs_data_out <= hs_byte_odd ? workram_cpu_rdata[7:0] : workram_cpu_rdata[15:8];
+
+	// RetroAchievements tap: port A is the ONLY write path into work RAM (CPU
+	// and hiscore restore alike), so snooping it keeps the mirror's shadow
+	// copy byte-exact without touching the RAM itself (a second read port
+	// would replicate the array, see above). FinalBurn Neo's "68K RAM" area
+	// is this RAM from 0xFE0000, and every RA address the Psikyo sets use is
+	// below 0x10000, so only the lower half is mirrored.
+	always_ff @(posedge clk) begin
+		ra_wr_word <= workram_a_addr[14:0];
+		ra_wr_din  <= workram_a_wdata;
+		ra_wr_be   <= workram_a_addr[15] ? 2'b00 : {workram_a_weh, workram_a_wel};
+	end
 
 	// ---- palette RAM: CPU write, compositor read ----
 	logic [11:0] pal_addr;

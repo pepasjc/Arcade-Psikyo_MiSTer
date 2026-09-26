@@ -122,6 +122,10 @@ module psikyo_top #(
 	output logic [7:0]  hs_data_out,
 	input  logic         hs_read,
 	input  logic         hs_write,
+	// RetroAchievements work-RAM write tap -- see psikyo_core's ports
+	output logic [14:0] ra_wr_word,
+	output logic [15:0] ra_wr_din,
+	output logic [1:0]  ra_wr_be,
 `ifdef DEBUG_ISSP
 	input  logic         dbg_autopause_wr_en,
 	input  logic         dbg_autopause_frame_en,
@@ -283,6 +287,7 @@ module psikyo_top #(
 		.snd_l_i(snd_left), .snd_r_i(snd_right), .snd_tick_i(jt_snd_sample),
 		.hs_address(hs_address), .hs_data_in(hs_data_in),
 		.hs_data_out(hs_data_out), .hs_read(hs_read), .hs_write(hs_write),
+		.ra_wr_word(ra_wr_word), .ra_wr_din(ra_wr_din), .ra_wr_be(ra_wr_be),
 `ifdef DEBUG_ISSP
 		.dbg_autopause_wr_en(dbg_autopause_wr_en), .dbg_autopause_frame_en(dbg_autopause_frame_en),
 `endif

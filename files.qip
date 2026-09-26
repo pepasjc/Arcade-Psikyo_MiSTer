@@ -66,6 +66,9 @@ set_global_assignment -name VERILOG_FILE rtl/hiscore.v
 # DDR3 -> SDRAM copier.
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/memory/ddram_phy.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/memory/rom_loader.sv
+
+# RetroAchievements RAM mirror (from jotego's JTFRAME, GPL-3.0-or-later).
+set_global_assignment -name VERILOG_FILE rtl/memory/jtframe_ra_mirror.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/sprite_display_list_walker.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/sprite_record_fetch.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/sprite_record_decode.sv

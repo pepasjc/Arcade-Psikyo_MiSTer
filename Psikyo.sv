@@ -54,7 +54,8 @@ assign ADC_BUS  = 'Z;
 assign USER_OUT = '1;
 assign {UART_RTS, UART_TXD, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
-// DDRAM is driven by screen_rotate_two (HDMI framebuffer rotation), below.
+// DDRAM is driven by screen_rotate_two (HDMI framebuffer rotation), the fast
+// ROM loader and the RetroAchievements RAM mirror -- see the mux at the end.
 
 assign VGA_F1 = 0;
 assign VGA_SCALER  = 0;
@@ -119,7 +120,7 @@ localparam DEBUG_TRACER_EN = 1'b0;
 wire debug_menu_hide = DEBUG_MENU_HIDE;
 
 localparam CONF_STR = {
-	"Psikyo;;",
+	"RA_Psikyo;;",
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[46:44],Scandoubler Fx,None,HQ2x,CRT 25%,CRT 50%,CRT 75%;",
@@ -642,6 +643,11 @@ wire [31:0] coin_in = {
 };
 wire [14:0] rgb;
 
+// RetroAchievements mirror write port (work RAM tap), see the mirror below
+wire [14:0] ra_wr_word;
+wire [15:0] ra_wr_din;
+wire  [1:0] ra_wr_be;
+wire        ra_active;  // the mirror owns the DDRAM port
 
 psikyo_top #(.BOARD_GUNBIRD(1'b0), .DEBUG_TRACER(DEBUG_TRACER_EN)) psikyo_top
 (
@@ -686,6 +692,7 @@ psikyo_top #(.BOARD_GUNBIRD(1'b0), .DEBUG_TRACER(DEBUG_TRACER_EN)) psikyo_top
 	.dbg_overlay(dbg_overlay), .dbg_render_dis(dbg_render_dis), .pause(pause_core),
 	.hs_address(hs_address), .hs_data_in(hs_data_in),
 	.hs_data_out(hs_data_out), .hs_read(hs_read), .hs_write(hs_write),
+	.ra_wr_word(ra_wr_word), .ra_wr_din(ra_wr_din), .ra_wr_be(ra_wr_be),
 `ifdef DEBUG_ISSP
 	.dbg_autopause_wr_en(dbg_autopause_wr_en), .dbg_autopause_frame_en(dbg_autopause_frame_en),
 `endif
@@ -870,7 +877,9 @@ wire [7:0]  ldr_DDRAM_BE;
 
 ddram_phy u_ldr_ddram (
 	.clk(clk_sys), .reset(reset),
-	.DDRAM_BUSY(DDRAM_BUSY), .DDRAM_BURSTCNT(ldr_DDRAM_BURSTCNT),
+	// ra_active: the RA mirror owns the port for its short VBlank copy; the
+	// loader then stalls exactly as it does on a busy DDR3.
+	.DDRAM_BUSY(DDRAM_BUSY | ra_active), .DDRAM_BURSTCNT(ldr_DDRAM_BURSTCNT),
 	.DDRAM_ADDR(ldr_DDRAM_ADDR), .DDRAM_DOUT(DDRAM_DOUT),
 	.DDRAM_DOUT_READY(DDRAM_DOUT_READY), .DDRAM_RD(ldr_DDRAM_RD),
 	.DDRAM_DIN(ldr_DDRAM_DIN), .DDRAM_BE(ldr_DDRAM_BE), .DDRAM_WE(ldr_DDRAM_WE),
@@ -950,7 +959,7 @@ screen_rotate_two screen_rotate_two
 	// accepted and advance its pointer, leaving a stale band in the frame
 	// buffer at a fixed position. It has no reset port, so nothing
 	// recovers that. Holding BUSY makes it stall and retry instead.
-	.DDRAM_BUSY    (DDRAM_BUSY | ldr_active),
+	.DDRAM_BUSY    (DDRAM_BUSY | ldr_active | ra_active),
 	.DDRAM_BURSTCNT(rot_DDRAM_BURSTCNT),
 	.DDRAM_ADDR    (rot_DDRAM_ADDR),
 	.DDRAM_DIN     (rot_DDRAM_DIN),
@@ -959,21 +968,70 @@ screen_rotate_two screen_rotate_two
 	.DDRAM_RD      (rot_DDRAM_RD)
 );
 
-// DDRAM pin mux: the ROM loader takes the bus while it is copying (core in
-// reset, nothing to display), the rotator has it the rest of the time.
+// ---- RetroAchievements RAM mirror (rtl/memory/jtframe_ra_mirror.v) ----
+// psikyo_core taps every write into the first 64 kB of the 68EC020 work RAM
+// (0xFE0000-0xFEFFFF) into a 64 kB shadow; once per frame the shadow is
+// copied to DDR3 at 0x3D000000 in the "RACH" layout the RA build of
+// Main_MiSTer reads. RA addresses are FinalBurn Neo's "68K RAM" area (the
+// whole 128 kB work RAM, d_psikyo.cpp), and every address the tengai, s1945
+// and gunbird sets use is below 0x10000, so the ARM region table is the
+// identity { 0x0000, 0x10000, 0x0000 }. FinalBurn Neo byte order: each
+// 16-bit word is stored as-is in a little-endian lane (mirror byte k = 68K
+// byte k^1).
+//
+// The rotator writes DDR whenever VGA_DE is high and ignores DDRAM_BUSY, so
+// the copy starts only once the output DE has been low for longer than any
+// HBlank: 4096 clocks = 48 us, against a 1632-clock native HBlank (136
+// pixels x 12) and a ~2.4 ms VBlank (38 lines of 5472 clocks). The copy
+// itself takes ~0.1 ms. It never starts during a ROM download or while the
+// fast ROM loader owns the port; the loader and the rotator see DDRAM_BUSY
+// while the mirror is active.
+reg [12:0] ra_de_idle = 13'd0;
+always @(posedge clk_sys) begin
+	if (VGA_DE) ra_de_idle <= 13'd0;
+	else if (~ra_de_idle[12]) ra_de_idle <= ra_de_idle + 13'd1;
+end
+
+wire  [7:0] ra_DDRAM_BURSTCNT, ra_DDRAM_BE;
+wire [28:0] ra_DDRAM_ADDR;
+wire [63:0] ra_DDRAM_DIN;
+wire        ra_DDRAM_WE;
+
+jtframe_ra_mirror #(.AW(16)) ra_mirror
+(
+	.rst         (~pll_locked),
+	.clk         (clk_sys),
+	.lvbl        (~ra_de_idle[12]),
+	.hold        (ioctl_download | ldr_active),
+	.wr_word     (ra_wr_word),
+	.wr_din      (ra_wr_din),
+	.wr_be       (ra_wr_be),
+	.active      (ra_active),
+	.ddr_busy    (DDRAM_BUSY),
+	.ddr_burstcnt(ra_DDRAM_BURSTCNT),
+	.ddr_addr    (ra_DDRAM_ADDR),
+	.ddr_we      (ra_DDRAM_WE),
+	.ddr_be      (ra_DDRAM_BE),
+	.ddr_din     (ra_DDRAM_DIN)
+);
+
+// DDRAM pin mux: the RA mirror while it copies (VBlank only, never during a
+// ROM load), the ROM loader while it is copying (core in reset, nothing to
+// display), the rotator the rest of the time. All three run on clk_sys
+// (the rotator's DDRAM_CLK is CLK_VIDEO = clk_sys).
 wire        rot_DDRAM_CLK;
 wire [7:0]  rot_DDRAM_BURSTCNT, rot_DDRAM_BE;
 wire [28:0] rot_DDRAM_ADDR;
 wire [63:0] rot_DDRAM_DIN;
 wire        rot_DDRAM_WE, rot_DDRAM_RD;
 
-assign DDRAM_CLK      = ldr_active ? clk_sys            : rot_DDRAM_CLK;
-assign DDRAM_BURSTCNT = ldr_active ? ldr_DDRAM_BURSTCNT : rot_DDRAM_BURSTCNT;
-assign DDRAM_ADDR     = ldr_active ? ldr_DDRAM_ADDR     : rot_DDRAM_ADDR;
-assign DDRAM_DIN      = ldr_active ? ldr_DDRAM_DIN      : rot_DDRAM_DIN;
-assign DDRAM_BE       = ldr_active ? ldr_DDRAM_BE       : rot_DDRAM_BE;
-assign DDRAM_WE       = ldr_active ? ldr_DDRAM_WE       : rot_DDRAM_WE;
-assign DDRAM_RD       = ldr_active ? ldr_DDRAM_RD       : rot_DDRAM_RD;
+assign DDRAM_CLK      = (ra_active | ldr_active) ? clk_sys : rot_DDRAM_CLK;
+assign DDRAM_BURSTCNT = ra_active ? ra_DDRAM_BURSTCNT : ldr_active ? ldr_DDRAM_BURSTCNT : rot_DDRAM_BURSTCNT;
+assign DDRAM_ADDR     = ra_active ? ra_DDRAM_ADDR     : ldr_active ? ldr_DDRAM_ADDR     : rot_DDRAM_ADDR;
+assign DDRAM_DIN      = ra_active ? ra_DDRAM_DIN      : ldr_active ? ldr_DDRAM_DIN      : rot_DDRAM_DIN;
+assign DDRAM_BE       = ra_active ? ra_DDRAM_BE       : ldr_active ? ldr_DDRAM_BE       : rot_DDRAM_BE;
+assign DDRAM_WE       = ra_active ? ra_DDRAM_WE       : ldr_active ? ldr_DDRAM_WE       : rot_DDRAM_WE;
+assign DDRAM_RD       = ra_active ? 1'b0              : ldr_active ? ldr_DDRAM_RD       : rot_DDRAM_RD;
 
 reg  [26:0] act_cnt;
 always @(posedge clk_sys) act_cnt <= act_cnt + 1'd1;
