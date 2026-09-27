@@ -98,8 +98,19 @@ wire        flip_180   = status[49];
 // support here; these two signals are the whole aspect story.
 wire [1:0] ar = status[122:121];
 
-assign VIDEO_ARX = (!ar) ? (rotate_en ? 13'd3 : 13'd4) : 13'({ar} - 2'd1);
-assign VIDEO_ARY = (!ar) ? (rotate_en ? 13'd4 : 13'd3) : 13'd0;
+// When the rotated frame buffer is cropped to the scaler's output height (see
+// "Rotated frame buffer crop" below), "Original" keeps the 3:4 geometry of the
+// full picture: h of H lines of a 3:4 frame are 3H:4h wide:high (224x320
+// cropped to 286 lines -> 960:1144 = 240:286). Lines still map 1:1; only the
+// width is scaled (224 -> 240). [ARC1] = 112:143 gives square pixels instead.
+reg         fb_crop = 1'b0;
+wire [11:0] rot_fb_height;
+wire [31:0] rot_fb_base;
+wire [11:0] fb_arx_crop = rot_fb_height * 2'd3;
+wire [11:0] fb_ary_crop = {FB_HEIGHT[9:0], 2'b00};
+
+assign VIDEO_ARX = (!ar) ? (fb_crop ? {1'b0, fb_arx_crop} : (rotate_en ? 13'd3 : 13'd4)) : 13'({ar} - 2'd1);
+assign VIDEO_ARY = (!ar) ? (fb_crop ? {1'b0, fb_ary_crop} : (rotate_en ? 13'd4 : 13'd3)) : 13'd0;
 
 `include "build_id.v"
 // Debug OSD page visibility: every P1 line carries an H1 prefix, so the
@@ -125,6 +136,7 @@ localparam CONF_STR = {
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[46:44],Scandoubler Fx,None,HQ2x,CRT 25%,CRT 50%,CRT 75%;",
 	"O[48:47],Rotation,Off,CW,CCW;",
+	"O[91],Rotated Height,Crop to Output,Scale;",
 	"O[49],Flip 180,Off,On;",
 	"O[80:79],Stereo Mix,Mono,None,25%,50%;",
 	"H3O[78],Autosave Hiscores,Off,On;",
@@ -945,8 +957,8 @@ screen_rotate_two screen_rotate_two
 	.FB_EN         (FB_EN),
 	.FB_FORMAT     (FB_FORMAT),
 	.FB_WIDTH      (FB_WIDTH),
-	.FB_HEIGHT     (FB_HEIGHT),
-	.FB_BASE       (FB_BASE),
+	.FB_HEIGHT     (rot_fb_height),
+	.FB_BASE       (rot_fb_base),
 	.FB_STRIDE     (FB_STRIDE),
 	.FB_VBL        (FB_VBL),
 	.FB_LL         (FB_LL),
@@ -967,6 +979,45 @@ screen_rotate_two screen_rotate_two
 	.DDRAM_WE      (rot_DDRAM_WE),
 	.DDRAM_RD      (rot_DDRAM_RD)
 );
+
+// ---- Rotated frame buffer crop ----
+// Rotated, the picture is 320 lines tall in the frame buffer (224x320). When
+// the scaler's active output height (HDMI_HEIGHT, 0 in direct video) is
+// smaller -- e.g. a 286-line 15 kHz video_mode -- ascal would shrink 320 lines
+// to fit with nearest-neighbour line drops, which shimmer when the picture
+// scrolls. Instead report only the middle HDMI_HEIGHT lines: FB_HEIGHT = the
+// visible lines and FB_BASE moved down by the top margin, so ascal reads them
+// 1:1. The rotator still writes whole frames into each of its three 8 MB
+// pages; the offset is added to whichever page base it currently presents
+// (o_fb, which flips on FB_VBL), so its triple/double buffering is
+// unaffected. Not rotated (including Flip 180 alone), direct video and
+// outputs >= the frame height are unchanged. OSD "Rotated Height" = Scale
+// restores the old behaviour. CLK_VIDEO (the rotator's clock) is clk_sys.
+reg  [11:0] fb_out_h_s0 = 12'd0, fb_out_h_s1 = 12'd0, fb_out_h_s2 = 12'd0;
+reg  [11:0] fb_out_h = 12'd0;
+reg  [11:0] fb_crop_h = 12'd0;
+reg  [11:0] fb_crop_lines = 12'd0;
+reg  [25:0] fb_crop_offset = 26'd0;
+reg  [31:0] fb_base_r = 32'd0;
+
+always @(posedge clk_sys) begin
+	// HDMI_HEIGHT comes from sys's clk_vid domain; it only changes on a video
+	// mode change, so take it once it has been stable for two samples.
+	fb_out_h_s0 <= HDMI_HEIGHT;
+	fb_out_h_s1 <= fb_out_h_s0;
+	fb_out_h_s2 <= fb_out_h_s1;
+	if (fb_out_h_s1 == fb_out_h_s2) fb_out_h <= fb_out_h_s2;
+
+	fb_crop <= ~status[91] & rotate_en &
+	           (fb_out_h != 12'd0) & (fb_out_h < rot_fb_height);
+	fb_crop_h <= fb_out_h;
+	fb_crop_lines <= (rot_fb_height - fb_out_h) >> 1;
+	fb_crop_offset <= fb_crop_lines * FB_STRIDE;
+	fb_base_r <= rot_fb_base + (fb_crop ? {6'd0, fb_crop_offset} : 32'd0);
+end
+
+assign FB_HEIGHT = fb_crop ? fb_crop_h : rot_fb_height;
+assign FB_BASE   = fb_base_r;
 
 // ---- RetroAchievements RAM mirror (rtl/memory/jtframe_ra_mirror.v) ----
 // psikyo_core taps every write into the first 64 kB of the 68EC020 work RAM
